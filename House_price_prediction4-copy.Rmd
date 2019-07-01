@@ -1,0 +1,640 @@
+---
+title: "House Price Prediction"
+date: "6/22/2019"
+output: html_document
+---
+
+
+```{r}
+library(dplyr)
+library(DataExplorer)
+library(ggplot2)
+library(glmnet)
+library(tidyverse)
+library(naniar)#missing val
+library(VIM)
+library(caret)
+library(car)
+library(MASS)
+library(xgboost)
+library(randomForest)
+library(corrplot)
+```
+
+#load data
+```{r}
+train<- read.csv("house prices/train.csv")
+test<- read.csv("house prices/test.csv")
+str(train)
+```
+
+
+#combine train and test dataset
+Since there is no response variable SalePrice in test dataset, we need to set this variable as NA when combining the two datasets
+```{r}
+test_label<-test$Id
+
+test$Id<- NULL
+train$Id<- NULL
+test$SalePrice <- NA
+train_label<- train$SalePrice
+
+
+all_feat<- rbind(train,test)
+
+introduce(all_feat)
+plot_intro(all_feat)
+```
+#deal with missing value
+**find the columns including missing values and see the missing numbers**
+```{r}
+NAcol <- which(colSums(is.na(all_feat)) > 0)
+sort(colSums(sapply(all_feat[NAcol], is.na)), decreasing = TRUE)
+```
+
+**impute missing data for Miscellaneous feature/Pool Quality/Type of Alley/Fence Quality/Fireplace quality**
+```{r}
+#sapply(all_feat,function(x)sum(is.na (x)))
+#gg_miss_var(all_feat)
+
+all_feat$MiscFeature <-ifelse(is.na(all_feat$MiscFeature),"None",paste(all_feat$MiscFeature)) # NA = None in the description
+sum (is.na (all_feat$MiscFeature))
+all_feat$PoolQC<- ifelse(is.na(all_feat$PoolQC),"No Pool",paste(all_feat$PoolQC))
+sum(is.na(all_feat$PoolQC))
+all_feat$Alley<- ifelse(is.na(all_feat$Alley),"No alley access",paste(all_feat$Alley))
+sum(is.na(all_feat$Alley))
+all_feat$Fence<- ifelse(is.na(all_feat$Fence),"No Fence", paste(all_feat$Fence))
+sum(is.na(all_feat$Fence))
+all_feat$FireplaceQu<- ifelse(is.na(all_feat$FireplaceQu),"No Fireplace", paste(all_feat$FireplaceQu))
+sum(is.na(all_feat$FireplaceQu))
+```
+**impute missing lotfrontage with median**
+```{r}
+ggplot(data=all_feat[!is.na(all_feat$LotFrontage),], aes(x=Neighborhood, y=LotFrontage)) +
+        geom_bar(stat='summary',fun.y = 'median',fill="red")+
+        theme(axis.text.x = element_text(angle = 50, hjust = 1))
+
+for (i in 1:nrow(all_feat)){
+        if(is.na(all_feat$LotFrontage[i])){
+               all_feat$LotFrontage[i] <- as.integer(median(all_feat$LotFrontage[all_feat$Neighborhood==all_feat$Neighborhood[i]], na.rm=T)) 
+        }
+}
+
+sum(is.na(all_feat$LotFrontage))
+```
+**deal with 6 Garage variables--GarageYrBlt/GarageFinish/GarageQual/GarageCond/GarageType/GarageCars/GarageArea**
+*place missing GarageYrBlt vaule with the year of the house was built.*
+```{r}
+all_feat$GarageYrBlt[is.na(all_feat$GarageYrBlt)] <- all_feat$YearBuilt[is.na(all_feat$GarageYrBlt)]
+sum(is.na(all_feat$GarageYrBl))
+
+
+```
+*impute missing data for GarageFinish(NA=159)/GarageQual(NA=159)/GarageCond(NA=159)/GarageType(NA=157)*
+*check if all 157 NAs are the same observations among the variables with 157/159 NAs*
+```{r}
+length(which(is.na(all_feat$GarageType) & is.na(all_feat$GarageFinish) & is.na(all_feat$GarageCond) & is.na(all_feat$GarageQual))) 
+
+```
+*Find the 2 additional NAs* 
+```{r}
+all_feat[!is.na(all_feat$GarageType) & is.na(all_feat$GarageFinish), c('GarageCars', 'GarageArea', 'GarageType', 'GarageCond', 'GarageQual', 'GarageFinish')]
+```
+It seems that house 2127 has garage, while house 2577 does not. Therefore, we plan to impute the most common values of GarageFinish, GarageQual, and GarageCond for house 2127
+```{r}
+all_feat$GarageCond[2127] <- names(sort(-table(all_feat$GarageCond)))[1]
+all_feat$GarageQual[2127] <- names(sort(-table(all_feat$GarageQual)))[1]
+all_feat$GarageFinish[2127] <- names(sort(-table(all_feat$GarageFinish)))[1]
+
+all_feat[2127, c('GarageYrBlt', 'GarageCars', 'GarageArea', 'GarageType', 'GarageCond', 'GarageQual', 'GarageFinish')]
+```
+For house 2577, all Garage variables except GarageType are NA. It is possible that house 2588 does not have cars. Therefore, we will set the Garage car capacity and Garage size as 0, and set Garage type as NA.
+```{r}
+all_feat$GarageCars[2577] <- 0
+all_feat$GarageArea[2577] <- 0
+all_feat$GarageType[2577] <- NA
+
+length(which(is.na(all_feat$GarageType) & is.na(all_feat$GarageFinish) & is.na(all_feat$GarageCond) & is.na(all_feat$GarageQual)))
+```
+The four variables GarageFinish, GarageQual, GarageCond, and GarageType now all have 158 NAs.
+```{r}
+all_feat$GarageType<- ifelse(is.na(all_feat$GarageType),'No Garage',paste(all_feat$GarageType))
+sum(is.na(all_feat$GarageType))
+all_feat$GarageFinish<- ifelse(is.na(all_feat$GarageFinish),'No Garage',paste(all_feat$GarageFinish))
+sum(is.na(all_feat$GarageFinish))
+all_feat$GarageQual<- ifelse(is.na(all_feat$GarageQual),'No Garage',paste(all_feat$GarageQual))
+sum(is.na(all_feat$GarageQual))
+all_feat$GarageCond<- ifelse(is.na(all_feat$GarageCond),'No Garage',paste(all_feat$GarageCond))
+sum(is.na(all_feat$GarageCond))
+```
+**Deal with 11 Basement variables' missing values**
+**Firstly deal with 5 Basement variables with more than 79 missing values--BsmtCond(NA=82)/BsmtExposure(NA=82)/BsmtQual(NA=81)/BsmtFinType2(NA=80)/BsmtFinType1(NA=79)** 
+*check if all 79 NAs are the same observations among the variables with 79-82 NAs*
+```{r}
+length(which(is.na(all_feat$BsmtQual) & is.na(all_feat$BsmtCond) & is.na(all_feat$BsmtExposure) & is.na(all_feat$BsmtFinType1) & is.na(all_feat$BsmtFinType2)))
+```
+*Since BsmtFinType1 has the fewest NAs, we try to find other basement variables' NAs more than 79 based on BsmtFinType1*
+```{r}
+all_feat[!is.na(all_feat$BsmtFinType1) & (is.na(all_feat$BsmtCond)|is.na(all_feat$BsmtQual)|is.na(all_feat$BsmtExposure)|is.na(all_feat$BsmtFinType2)), c('BsmtQual', 'BsmtCond', 'BsmtExposure', 'BsmtFinType1', 'BsmtFinType2')]
+```
+Next,we plan to impute the most common values for NA values of the above 9 houses, since all the 9 houses with missing basement values seem to have basement bacause their columns are 80% complete.
+```{r}
+all_feat$BsmtFinType2[333] <- names(sort(-table(all_feat$BsmtFinType2)))[1]
+all_feat$BsmtExposure[c(949, 1488, 2349)] <- names(sort(-table(all_feat$BsmtExposure)))[1]
+all_feat$BsmtCond[c(2041, 2186, 2525)] <- names(sort(-table(all_feat$BsmtCond)))[1]
+all_feat$BsmtQual[c(2218, 2219)] <- names(sort(-table(all_feat$BsmtQual)))[1]
+length(which(is.na(all_feat$BsmtQual) & is.na(all_feat$BsmtCond) & is.na(all_feat$BsmtExposure) & is.na(all_feat$BsmtFinType1) & is.na(all_feat$BsmtFinType2)))
+```
+The five basement variables BsmtQual, BsmtCond, BsmtExposure, BsmtFinType1 and BsmtFinType2 now all have 158 NAs.
+```{r}
+all_feat$BsmtQual<- ifelse(is.na(all_feat$BsmtQual),'No Basement',paste(all_feat$BsmtQual))
+sum(is.na(all_feat$BsmtQual))
+all_feat$BsmtCond<- ifelse(is.na(all_feat$BsmtCond),'No Basement',paste(all_feat$BsmtCond))
+sum(is.na(all_feat$BsmtCond))
+all_feat$BsmtExposure<- ifelse(is.na(all_feat$BsmtExposure),'No Basement',paste(all_feat$BsmtExposure))
+sum(is.na(all_feat$BsmtExposure))
+all_feat$BsmtFinType1<- ifelse(is.na(all_feat$BsmtFinType1),'No Basement',paste(all_feat$BsmtFinType1))
+sum(is.na(all_feat$BsmtFinType1))
+all_feat$BsmtFinType2<- ifelse(is.na(all_feat$BsmtFinType2),'No Basement',paste(all_feat$BsmtFinType2))
+sum(is.na(all_feat$BsmtFinType2))
+```
+**Secondly deal with remaining 6 basement variables with only one or two missing values--BsmtFullBath(NA=2)/BsmtHalfBath(NA=2)/BsmtFinSF1(NA=1)/BsmtFinSF2(NA=1)/BsmtUnfSF(NA=1)/TotalBsmtSF(NA=1)**
+```{r}
+all_feat[(is.na(all_feat$BsmtFullBath)|is.na(all_feat$BsmtHalfBath)|is.na(all_feat$BsmtFinSF1)|is.na(all_feat$BsmtFinSF2)|is.na(all_feat$BsmtUnfSF)|is.na(all_feat$TotalBsmtSF)), c('BsmtQual', 'BsmtFullBath', 'BsmtHalfBath', 'BsmtFinSF1', 'BsmtFinSF2', 'BsmtUnfSF', 'TotalBsmtSF')]
+
+```
+It can be seen that the missing values are actually not present and should equal to 0.
+```{r}
+all_feat$BsmtFullBath<- ifelse(is.na(all_feat$BsmtFullBath),0,paste(all_feat$BsmtFullBath))
+sum(is.na(all_feat$BsmtFullBath))
+all_feat$BsmtHalfBath<- ifelse(is.na(all_feat$BsmtHalfBath),0,paste(all_feat$BsmtHalfBath))
+sum(is.na(all_feat$BsmtHalfBath))
+all_feat$BsmtFinSF1<- ifelse(is.na(all_feat$BsmtFinSF1),0,paste(all_feat$BsmtFinSF1))
+sum(is.na(all_feat$BsmtFinSF1))
+all_feat$BsmtFinSF2<- ifelse(is.na(all_feat$BsmtFinSF2),0,paste(all_feat$BsmtFinSF2))
+sum(is.na(all_feat$BsmtFinSF2))
+all_feat$BsmtUnfSF<- ifelse(is.na(all_feat$BsmtUnfSF),0,paste(all_feat$BsmtUnfSF))
+sum(is.na(all_feat$BsmtUnfSF))
+all_feat$TotalBsmtSF<- ifelse(is.na(all_feat$TotalBsmtSF),0,paste(all_feat$TotalBsmtSF))
+sum(is.na(all_feat$TotalBsmtSF))
+```
+**Deal with 2 Masonry variables' missing values--MasVnrType(NA=24) and MasVnrArea(NA=23)** 
+*check if all 23 NAs of MasVnrArea are the same observations among the MasVnrType with 24 NAs*
+```{r}
+length(which(is.na(all_feat$MasVnrType) & is.na(all_feat$MasVnrArea)))
+```
+*find the house which should have MasVnrType value*
+```{r}
+all_feat[is.na(all_feat$MasVnrType) & !is.na(all_feat$MasVnrArea), c('MasVnrType', 'MasVnrArea')]
+```
+Next, we replace the missing value to the 2nd most common values of MasVnrType, because the most common type is none.
+```{r}
+sort(-table(all_feat$MasVnrType))
+all_feat$MasVnrType[2611] <- names(sort(-table(all_feat$MasVnrType)))[2]
+all_feat[2611, c('MasVnrType', 'MasVnrArea')]
+```
+Impute the remaining 23 sets missing Masonry variables to None.
+```{r}
+all_feat$MasVnrType<- ifelse(is.na(all_feat$MasVnrType),'None',paste(all_feat$MasVnrType))
+sum(is.na(all_feat$MasVnrType))
+all_feat$MasVnrArea<- ifelse(is.na(all_feat$MasVnrArea),0,paste(all_feat$MasVnrArea))
+sum(is.na(all_feat$MasVnrArea))
+```
+
+
+**impute missing data for MSZoning(NA=4)/KitchenQual(NA=4)/Functional(NA=1)/Exterior1st(NA=1)/Electrical(NA=1)/SaleType(NA=1)**
+```{r}
+all_feat$MSZoning[is.na(all_feat$MSZoning)] <- names(sort(-table(all_feat$MSZoning)))[1]
+sum(is.na(all_feat$MSZoning))
+all_feat$KitchenQual[is.na(all_feat$KitchenQual)] <- names(sort(-table(all_feat$KitchenQual)))[1]
+sum(is.na(all_feat$KitchenQual))
+all_feat$Functional[is.na(all_feat$Functional)] <- names(sort(-table(all_feat$Functional)))[1]
+sum(is.na(all_feat$Functional))
+all_feat$Exterior1st[is.na(all_feat$Exterior1st)] <- names(sort(-table(all_feat$Exterior1st)))[1]
+sum(is.na(all_feat$Exterior1st))
+all_feat$Exterior2nd[is.na(all_feat$Exterior2nd)] <- names(sort(-table(all_feat$Exterior2nd)))[1]
+sum(is.na(all_feat$Exterior2nd))
+all_feat$Electrical[is.na(all_feat$Electrical)] <- names(sort(-table(all_feat$Electrical)))[1]
+sum(is.na(all_feat$Electrical))
+all_feat$SaleType[is.na(all_feat$SaleType)] <- names(sort(-table(all_feat$SaleType)))[1]
+sum(is.na(all_feat$SaleType))
+```
+
+**impute missing data for Utilities(NA=4)**
+Since most Utilities are ALLPub and only one Utility is NoSeWa.Therefore, we do not plan to replace the only 4 missing values for Utilities, because this is useless for prediction. We will get rid of this column.
+```{r}
+table(all_feat$Utilities)
+all_feat$Utilities <- NULL
+
+sapply(all_feat,function(x)sum(is.na (x)))
+
+```
+
+
+
+**Correcting Variable types**
+```{r}
+all_feat$MSSubClass<- as.factor(all_feat$MSSubClass)
+all_feat$OverallQual <- as.factor(all_feat$OverallQual)
+all_feat$OverallCond <- as.factor(all_feat$OverallCond)
+all_feat$YearBuilt<- as.factor(all_feat$YearBuilt)
+all_feat$YearRemodAdd <- as.factor(all_feat$YearRemodAdd)
+all_feat$GarageYrBlt <- as.factor(all_feat$GarageYrBlt)
+all_feat$YrSold<-as.factor(all_feat$YrSold)
+all_feat$MoSold<- as.factor(all_feat$MoSold)
+all_feat$BsmtQual <- as.factor(all_feat$BsmtQual)
+all_feat$Alley<- as.factor(all_feat$Alley)
+all_feat$MasVnrType<- as.factor(all_feat$MasVnrTyp)
+all_feat$BsmtCond<- as.factor(all_feat$BsmtCond)
+all_feat$BsmtExposure<- as.factor(all_feat$BsmtExposure)
+all_feat$BsmtFinType1<- as.factor(all_feat$BsmtFinType1)
+all_feat$BsmtFinType2<- as.factor(all_feat$BsmtFinType2)
+all_feat$FireplaceQu <- as.factor(all_feat$FireplaceQu)
+all_feat$GarageType <- as.factor(all_feat$GarageType)
+all_feat$GarageFinish <- as.factor(all_feat$GarageFinish)
+all_feat$GarageQual <- as.factor(all_feat$GarageQual)
+all_feat$PoolQC <- as.factor(all_feat$PoolQC)
+all_feat$Fence <- as.factor(all_feat$Fence)
+all_feat$MiscFeature <- as.factor(all_feat$MiscFeature)
+all_feat$GarageCond<- as.factor(all_feat$GarageCond)
+
+
+all_feat$BsmtFullBath<- as.integer(all_feat$BsmtFullBath)
+all_feat$BsmtHalfBath<- as.integer(all_feat$BsmtHalfBath)
+all_feat$TotalBsmtSF<- as.integer(all_feat$TotalBsmtSF)
+all_feat$BsmtFinSF1 <- as.integer(all_feat$BsmtFinSF1)
+all_feat$BsmtFinSF2  <- as.integer(all_feat$BsmtFinSF2 )
+all_feat$BsmtUnfSF  <- as.integer(all_feat$BsmtUnfSF )
+all_feat$MasVnrArea <- as.integer(all_feat$MasVnrArea)
+
+str(all_feat)
+```
+
+
+#EDA
+```{r}
+#correlations Plot
+nums <- unlist(sapply(all_feat, is.numeric))
+
+all_nums <- all_feat[,nums]
+cor_numVar <- cor(all_nums, use  = "pairwise.complete.obs") #correlations of all numeric variables
+
+#sort on decreasing correlations with SalePrice
+cor_sorted <- as.matrix(sort(cor_numVar[,"SalePrice"], decreasing = T))
+
+#select only high corelations
+CorHigh <- names(which(apply(cor_sorted, 1, function(x) abs(x)>0.5)))
+cor_numVar <- cor_numVar[CorHigh, CorHigh]
+
+corrplot.mixed(cor_numVar,tl.pos = "lt")
+
+
+
+plot_histogram(all_feat)
+plot_bar(all_feat)
+plot_intro(all_feat)
+
+
+ggplot(all_feat,aes(x= YearBuilt,y= SalePrice))+ geom_point(alpha=0.5,color="blue",na.rm = T)+
+  geom_smooth(method = "lm")+ 
+  theme(axis.text.x = element_text(size= 8,angle = 90, hjust = 1) ,legend.position="none" )
+
+
+#numeric
+all_feat$SalePrice<- log10(all_feat$SalePrice)
+
+attach(all_feat)
+hist(SalePrice,xlab = "Log_price",col = "blue")
+
+a<- ggplot(all_feat,aes(y=SalePrice,color= SalePrice))
+#Sales Price vs Linear feet of street connected to property
+a+ geom_point(aes(x=LotFrontage),alpha=0.5) 
+#Sales Price vs Lot size
+a+ geom_point(aes(x=LotArea),alpha=0.5)
+# Sales Vs Above ground living Area 
+a+ geom_point(aes(x=GrLivArea),alpha=0.5) # house 1299 & 524 are outliers
+#Sales Price vs Masonry veneer area 
+a+ geom_point(aes(x=MasVnrArea),alpha=0.5)
+#Sales Price vs Type 1 finished square feet
+a+ geom_point(aes(x=BsmtFinSF1),alpha=0.5)
+#Sales Price vs Total square feet of basement area
+a+geom_point(aes(x=TotalBsmtSF),alpha=0.5)
+#Sales Price vs First Floor square feet
+a+geom_point(aes(x=X1stFlrSF),alpha=0.5) 
+#Sales Price vs Second floor square feet
+a+geom_point(aes(x=X2ndFlrSF),alpha=0.5)
+#Sales Price vs Low quality finished square feet
+a+geom_point(aes(x=LowQualFinSF),alpha=0.5)
+#Sales Price vs Size of garage 
+a+geom_point(aes(x=GarageArea),alpha=0.5)
+#Sales Price vs Size of garage in car capacity
+a+ geom_boxplot(aes(x=factor((GarageCars)),alpha=0.5))
+# Sales Price vs Garage Capacity 
+ggplot(all_feat,aes(x= factor(GarageCars),y= SalePrice))+geom_boxplot(color= "blue")
+# Sales Price vs Overall building quality  
+ggplot(all_feat,aes(x= factor(OverallQual),y= SalePrice))+geom_boxplot(color= "blue")
+# Sales Price vs House condition
+ggplot(all_feat,aes(x= factor(OverallCond),y= SalePrice))+geom_boxplot(color= "blue")
+
+```
+
+#normalize variables
+```{r}
+data <- subset(all_feat, select = -c(GarageArea,TotRmsAbvGrd,LowQualFinSF,X1stFlrSF))# due to high correlations 
+
+data<- data[-c(1299,524),]# remove outlier 
+
+nums.data <- unlist(sapply(data, is.numeric))
+nums.data<- data[,nums.data]
+summary(nums.data)
+
+# we find that most of our numeric varialbes has value of 0. Therefore, we need to normalize them with log(x+min(x)+1) to aviod "inf"
+data$LotFrontage<-log10(data$LotFrontage)
+data$LotArea<- log10(data$LotArea)
+data$GrLivArea<-log10(data$GrLivArea)
+# Variables that contains Zero.
+data$X2ndFlrSF<- log10(data$X2ndFlrSF+ min(data$X2ndFlrSF)+ 1)
+data$FullBath<- log10(data$FullBath+ min(data$FullBath)+ 1)
+data$HalfBath<- log10(data$HalfBath+ min(data$HalfBath)+ 1)
+data$BedroomAbvGr<- log10(data$BedroomAbvGr+ min(data$BedroomAbvGr)+ 1)
+data$KitchenAbvGr<- log10(data$KitchenAbvGr+ min(data$KitchenAbvGr)+ 1)
+data$Fireplaces<-log10(data$Fireplaces+ min(data$Fireplaces)+ 1)
+data$GarageCars<- log10(data$GarageCars+ min(data$GarageCars)+ 1)
+data$WoodDeckSF<- log10(data$WoodDeckSF+ min(data$WoodDeckSF)+ 1)
+data$OpenPorchSF<- log10(data$OpenPorchSF+ min(data$OpenPorchSF)+ 1)
+data$EnclosedPorch<- log10(data$EnclosedPorch+ min(data$EnclosedPorch)+ 1)
+data$X3SsnPorch<- log10(data$X3SsnPorch+ min(data$X3SsnPorch)+ 1)
+data$ScreenPorch<- log10(data$ScreenPorch+ min(data$ScreenPorch)+ 1)
+data$PoolArea<- log10(data$PoolArea+ min(data$PoolArea)+ 1)
+data$MiscVal<- log10(data$MiscVal+ min(data$MiscVal)+ 1)
+data$BsmtUnfSF <- log10(data$BsmtUnfSF+ min(data$BsmtUnfSF)+ 1)
+data$BsmtFinSF1<- log10(data$BsmtFinSF1+ min(data$BsmtFinSF1)+ 1)
+data$BsmtFinSF2<- log10(data$BsmtFinSF2+ min(data$BsmtFinSF2)+ 1)
+data$TotalBsmtSF<- log10(data$TotalBsmtSF+ min(data$TotalBsmtSF)+ 1)
+data$BsmtFullBath<- log10(data$BsmtFullBath+ min(data$BsmtFullBath)+ 1)
+data$BsmtHalfBath<- log10(data$BsmtHalfBath+ min(data$BsmtHalfBath)+ 1)
+
+sapply(data,function(x) any(is.infinite(x)))
+
+plot_histogram(data)
+str(data)
+```
+
+# Data partation: train & test
+```{r}
+model.data<- data[!is.na(data$SalePrice),]
+sapply(model.data,function(x)sum(is.na (x)))
+
+str(model.data)
+
+set.seed(111)
+row.number <- sample(x=1:nrow(model.data),size = 0.8*nrow(model.data))
+model.train <- model.data[row.number,]
+model.test <- model.data[-row.number,]
+```
+
+# Modeling 
+
+```{r}
+# Baseline OLS Fiting
+lm1<- lm(SalePrice~. ,data = model.train)
+summary(lm1)
+plot(lm1)
+#car::vif(lm1)
+```
+
+
+# Stepwise Variables selection
+```{r}
+step<- stepAIC(lm1,direction = "backward")
+step$anova
+
+# Stepwise model
+Step.model<- lm(SalePrice ~ MSZoning + LotArea + Street + Alley + LotConfig + 
+    LandSlope + Neighborhood + Condition1 + BldgType + HouseStyle + 
+    OverallQual + OverallCond + YearBuilt + YearRemodAdd + RoofMatl + 
+    Exterior1st + Exterior2nd + MasVnrType + MasVnrArea + ExterCond + 
+    Foundation + BsmtQual + BsmtExposure + BsmtFinType1 + BsmtFinSF1 + 
+    TotalBsmtSF + Heating + HeatingQC + CentralAir + Electrical + 
+    X2ndFlrSF + GrLivArea + BsmtFullBath + BsmtHalfBath + FullBath + 
+    HalfBath + BedroomAbvGr + KitchenQual + Functional + Fireplaces + 
+    GarageType + GarageYrBlt + GarageCars + GarageCond + PavedDrive + 
+    WoodDeckSF + EnclosedPorch + ScreenPorch + PoolArea + PoolQC + 
+    Fence + MiscFeature + MiscVal + MoSold + YrSold + SaleType + 
+    SaleCondition, data = model.train)
+summary(Step.model)
+LinerDep.vars <- attributes(alias(Step.model)$Complete)$dimnames[[1]]
+LinerDep.vars
+
+Step.2<- lm(SalePrice ~ MSZoning + LotArea + Street + Alley + LotConfig + 
+    LandSlope + Neighborhood + Condition1 + BldgType + HouseStyle + 
+    OverallQual + OverallCond + YearBuilt +  RoofMatl + 
+    Exterior1st +  MasVnrType + MasVnrArea + ExterCond + 
+    Foundation + BsmtQual +  BsmtFinSF1 + 
+    TotalBsmtSF + HeatingQC + CentralAir + Electrical + 
+    X2ndFlrSF + GrLivArea + BsmtFullBath + BsmtHalfBath + FullBath + 
+    HalfBath + BedroomAbvGr + KitchenQual + Functional + Fireplaces + 
+    GarageType +  GarageCars +  PavedDrive + 
+    WoodDeckSF + EnclosedPorch + ScreenPorch + PoolArea + PoolQC + 
+    Fence + MiscFeature + MiscVal + MoSold + YrSold + SaleType + 
+    SaleCondition, data = model.train)
+car::vif(Step.2)
+
+Step.refine<- lm(SalePrice ~ MSZoning + LotArea + Street + Alley + LotConfig + 
+    LandSlope   + BldgType + HouseStyle + 
+    OverallQual + OverallCond +RoofMatl  +  MasVnrType + MasVnrArea + ExterCond + 
+    Foundation + BsmtQual +  BsmtFinSF1 + 
+    TotalBsmtSF + HeatingQC + CentralAir + Electrical + 
+    X2ndFlrSF + GrLivArea + BsmtFullBath + BsmtHalfBath + FullBath + 
+    HalfBath + BedroomAbvGr + KitchenQual + Functional + Fireplaces + 
+    GarageType +  GarageCars +  PavedDrive + 
+    WoodDeckSF + EnclosedPorch + ScreenPorch + PoolArea + PoolQC + 
+    Fence + MiscFeature + MiscVal  + YrSold + SaleType + 
+    SaleCondition, data = model.train)
+car::vif(Step.refine)
+summary(Step.refine)
+
+step2<- stepAIC(Step.refine,direction = "backward")
+step2$anova
+
+Step.fianl.model<- lm(SalePrice ~ MSZoning + LotArea + Alley + LandSlope + BldgType + 
+    OverallQual + OverallCond + MasVnrArea + Foundation + BsmtQual + 
+    BsmtFinSF1 + TotalBsmtSF + HeatingQC + CentralAir + X2ndFlrSF + 
+    GrLivArea + BsmtFullBath + FullBath + HalfBath + BedroomAbvGr + 
+    KitchenQual + Functional + Fireplaces + GarageType + GarageCars + 
+    PavedDrive + WoodDeckSF + ScreenPorch + PoolQC + SaleType + 
+    SaleCondition,data = model.train)
+summary(Step.fianl.model)
+car::vif(Step.fianl.model)
+```
+# Random Forest
+```{r}
+RF<- randomForest(SalePrice~ MSZoning + LotArea + Alley + LandSlope + BldgType + 
+    OverallQual + OverallCond + MasVnrArea + Foundation + BsmtQual + 
+    BsmtFinSF1 + TotalBsmtSF + HeatingQC + CentralAir + X2ndFlrSF + 
+    GrLivArea + BsmtFullBath + FullBath + HalfBath + BedroomAbvGr + 
+    KitchenQual + Functional + Fireplaces + GarageType + GarageCars + 
+    PavedDrive + WoodDeckSF + ScreenPorch + PoolQC + SaleType + 
+    SaleCondition,data= model.train,
+     method = "anova",
+    importance = T
+    )
+
+RF_predicted <- predict(RF, newdata= model.test) 
+
+# model accuracy 
+ssr <- sum((RF_predicted - model.test$SalePrice)^2)
+sse <- sum((RF_predicted - mean(model.test$SalePrice))^2)
+sst <- ssr + sse
+rsq <- 1 - ssr/sst
+
+mse <- mean((RF_predicted - model.test$SalePrice)^2)
+
+rmse <- RMSE(RF_predicted,model.test$SalePrice)
+
+accuracy <- data.frame(row.names = "Random Forest",rsq,mse,rmse)
+```
+
+# Ridge Regression 
+```{r}
+x <- model.matrix(SalePrice~.,model.train)[,-1]
+y <- model.train$SalePrice
+
+fit.ridge <- glmnet(x,y,alpha = 0)
+plot(fit.ridge,xvar="lambda",label=TRUE)
+
+cv_ridge <- cv.glmnet(x=x, y=y, alpha = 0, nlambda = 1000)
+plot.cv.glmnet(cv_ridge)
+best.lambda <- cv_ridge$lambda.min
+
+ridge_model <- glmnet(x=x, y=y, alpha = 0, lambda=best.lambda)
+ridge_model$beta
+
+coef(ridge_model)
+
+#
+x.test <- model.matrix(SalePrice~.,model.test)[,-1]
+y.test <- model.test$SalePrice
+
+ridge_predicted <- predict.glmnet(ridge_model,s=best.lambda,newx = x.test)
+
+# model accuracy 
+ssr <- sum((ridge_predicted - y.test)^2)
+sse <- sum((ridge_predicted - mean(y.test))^2)
+sst <- ssr + sse
+rsq <- 1 - ssr/sst
+
+mse <- mean((ridge_predicted - y.test)^2)
+rmse <- RMSE(ridge_predicted,y.test)
+
+accuracy2 <- data.frame(row.names = "Ridge",rsq,mse,rmse)
+```
+
+#Lasso
+```{r}
+
+fit.lasso <- glmnet(x,y,alpha = 1)
+plot(fit.lasso,xvar="lambda",label=TRUE)
+
+cv_lasso <- cv.glmnet(x=x, y=y, alpha = 1, nlambda = 1000)
+plot.cv.glmnet(cv_lasso)
+best.lambda <- cv_lasso$lambda.min
+
+lasso <- glmnet(x=x,y=y,alpha = 1, lambda = best.lambda)
+lasso$beta
+
+coef(lasso)
+
+x.test <- model.matrix(SalePrice~.,model.test)[,-1]
+y.test <- model.test$SalePrice
+
+lasso_predicted <- predict.glmnet(lasso, s = best.lambda, newx = x.test)
+
+
+#accuracy 
+ssr <- sum((lasso_predicted - y.test)^2)
+sse <- sum((lasso_predicted - mean(y.test))^2)
+sst <- ssr + sse
+rsq <- 1 - ssr/sst
+mse <- mean((lasso_predicted - y.test)^2)
+rmse <- RMSE(lasso_predicted,y.test)
+
+accuracy3 <- data.frame(row.names = "Lasso",rsq,mse,rmse)
+
+```
+
+#XGboost
+```{r}
+xgb.parameters = list(
+  seed =0,
+  eta = 0.1,
+  alpha = 1,
+  objective = "reg:linear",
+  eval_metric = "rmse",
+  gamma= 0.05,
+  max_depth= 6,
+  min_child_weight = 1,
+  colsample_bytree = 0.5,
+  subsample = 0.5,
+  nfold= 5,
+  nthread = 8
+  
+)
+
+
+
+X_train  <- xgb.DMatrix(data.matrix(model.train[, -75]), label = as.numeric(model.train$SalePrice))
+
+     
+
+xgb<- xgb.train(xgb.parameters,data = X_train,nround=2200)
+
+x.test <- data.matrix(model.test[, -75])
+y.test<- model.test$SalePrice
+
+xgb_predicted <- predict(xgb, newdata  = x.test)
+
+ssr <- sum((xgb_predicted - y.test)^2)
+sse <- sum((xgb_predicted - mean(y.test))^2)
+sst <- ssr + sse
+rsq <- 1 - ssr/sst
+mse <- mean((xgb_predicted - y.test)^2)
+rmse <- RMSE(xgb_predicted,y.test)
+
+accuracy4 <- data.frame(row.names = "XGB",rsq,mse,rmse)
+
+
+
+
+```
+#combining all models together
+```{r}
+combine_predicted<- (RF_predicted + ridge_predicted + lasso_predicted + xgb_predicted)/4
+
+ssr <- sum((combine_predicted - y.test)^2)
+sse <- sum((combine_predicted - mean(y.test))^2)
+sst <- ssr + sse
+rsq <- 1 - ssr/sst
+mse <- mean((combine_predicted - y.test)^2)
+rmse<- RMSE(combine_predicted,y.test)
+
+accuracy5 <- data.frame(row.names = "Blend.Model",rsq,mse,rmse)
+
+accuracy_table<- rbind(accuracy,accuracy2,accuracy3,accuracy4,accuracy5)
+
+accuracy_table
+```
+
+#visualize the final fit
+```{r}
+result<-data.frame(cbind("blend.predicted"=combine_predicted,y.test))
+names(result)[1]<- "blend.predicted"
+
+
+length(accuracy_table$rmse)
+length(accuracy[0])
+
+ggplot(data = result, aes(x= blend.predicted, y= y.test)) + geom_point(alpha=0.5,color="blue")+ geom_smooth(method = "lm")
+
+```
+
